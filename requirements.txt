@@ -6,5 +6,3 @@ python-docx
 PyMuPDF
 opencv-python-headless
 numpy
-langchain
-openai
