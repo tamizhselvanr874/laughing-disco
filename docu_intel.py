@@ -1,358 +1,501 @@
-import streamlit as st
-import requests
-import json
-import os
-from pathlib import Path
-import fitz  # PyMuPDF
-from langchain_openai import AzureChatOpenAI
-from tenacity import retry, wait_random_exponential, stop_after_attempt
-from docx import Document
-from docx.shared import Inches
-import io
-import re
-from PIL import Image
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# Configuration
-GRAPH_TENANT_ID = "4d4343c6-067a-4794-91f3-5cb10073e5b4"
-GRAPH_CLIENT_ID = "5ace14db-3235-4cd2-acfd-dd5ef19d6ea1"
-GRAPH_CLIENT_SECRET = "HRk8Q~7G6EH3.yhDC3rB5wLAyAixQMnQNWNyUdsW"
-PDF_SITE_ID = "marketingai.sharepoint.com,b82dbaac-09cc-4539-ad08-e4ca926796e8,7b756d20-3463-44b7-95ca-5873f8c3f517"
-FUNCTION_URL = "https://doc2pdf.azurewebsites.net"
-
-# Azure OpenAI API details
-azure_endpoint = 'https://chat-gpt-a1.openai.azure.com/'
-azure_deployment_name = 'DanielChatGPT16k'
-azure_api_key = 'c09f91126e51468d88f57cb83a63ee36'
-azure_api_version = '2024-05-01-preview'
-
-# Initialize Azure OpenAI LLM
-llm = AzureChatOpenAI(
-    openai_api_key=azure_api_key,
-    api_version=azure_api_version,
-    azure_endpoint=azure_endpoint,
-    model="gpt-4",
-    azure_deployment=azure_deployment_name,
-    temperature=0.5
-)
-
-def get_oauth2_token():
-    url = f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}/oauth2/v2.0/token"
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    data = {
-        'grant_type': 'client_credentials',
-        'client_id': GRAPH_CLIENT_ID,
-        'client_secret': GRAPH_CLIENT_SECRET,
-        'scope': 'https://graph.microsoft.com/.default'
-    }
-    response = requests.post(url, headers=headers, data=data)
-    if response.status_code == 200:
-        return response.json().get('access_token')
-    else:
-        st.error(f"Failed to obtain OAuth2 token: {response.content}")
-        return None
-
-def upload_file_to_sharepoint(token, file):
-    upload_url = f"https://graph.microsoft.com/v1.0/sites/{PDF_SITE_ID}/drive/root:/{file.name}:/content"
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': file.type
-    }
-    response = requests.put(upload_url, headers=headers, data=file.getvalue())
-    
-    if response.status_code in [200, 201]:
-        return response.json().get('id')
-    else:
-        st.error(f"Failed to upload file to SharePoint: {response.content}")
-        return None
-
-def convert_file_to_pdf(token, file_id):
-    convert_url = f"https://graph.microsoft.com/v1.0/sites/{PDF_SITE_ID}/drive/items/{file_id}/content?format=pdf"
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json'
-    }
-    response = requests.get(convert_url, headers=headers)
-    if response.status_code == 200:
-        return response.content
-    else:
-        st.error(f"Failed to convert file to PDF: {response.content}")
-        return None
-
-def delete_file_from_sharepoint(token, file_id):
-    delete_url = f"https://graph.microsoft.com/v1.0/sites/{PDF_SITE_ID}/drive/items/{file_id}"
-    headers = {'Authorization': f'Bearer {token}'}
-    response = requests.delete(delete_url, headers=headers)
-    if response.status_code == 204:
-        return True
-    else:
-        st.error(f"Failed to delete file from SharePoint: {response.content}")
-        return False
-
-def read_prompt(prompt_path: str):
-    with open(prompt_path, "r") as f:
-        return f.read()
-
-def extract_text_from_pdf(pdf_path: str):
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page_num, page in enumerate(doc):
-        page_text = page.get_text()
-        print(f"Extracting text from Page {page_num + 1}: {page_text[:100]}...")  # Print the first 100 characters for debugging
-        text += f"Page {page_num + 1}\n" + page_text
-    return text
-
-def extract_images_from_pdf(pdf_path: str, output_folder: str):
-    doc = fitz.open(pdf_path)
-    images = []
-    
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    for page_number in range(len(doc)):
-        page = doc[page_number]
-        image_list = page.get_images(full=True)
-        
-        for image_index, img in enumerate(image_list, start=1):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-            image_path = os.path.join(output_folder, f"image_{page_number + 1}_{image_index}.{image_ext}")
-            
-            with open(image_path, "wb") as img_file:
-                img_file.write(image_bytes)
-            
-            # Simulate meaningful and relevant image titles and descriptions
-            image_title = f"Figure {page_number + 1}.{image_index}: Description of key feature"
-            image_description = f"This figure illustrates key aspect {image_index} found on page {page_number + 1}."
-
-            images.append({
-                "page_number": page_number + 1,
-                "title": image_title,
-                "description": image_description,
-                "image_url": image_path
-            })
-    
-    return images
-
-@retry(wait=wait_random_exponential(min=1, max=120), stop=stop_after_attempt(10))
-def completion_with_backoff(prompt: str, content: str):
-    try:
-        response = llm(
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": content}
-            ]
-        )
-        return response
-    except Exception as e:
-        print(f"Error calling Azure OpenAI API: {e}")
-        return {}
-
-def extract_metadata(content: str):
-    prompt = """Patent Document Analysis Prompt:
-
-    You are an expert tasked with analyzing patent documents. Please thoroughly review the provided patent document and extract the following key information from each page:
-
-    1. Page Number: Identify the page number of the document.
-    2. Page Title: Extract the title or heading of the page.
-    3. Page Content: Extract the exact main content and context of the page as it appears in the document, without any summarization.
-    4. Image: Identify and extract any images present on the page along with relevant metadata. This includes the image title, description, and any other pertinent information.
-
-    Guidelines:
-    - Ensure that all extracted information is factual, accurate, and directly derived from the document.
-    - For the "Page Title" and "Image" sections, provide concise and descriptive information.
-    - The information should be self-contained, meaning that each extracted piece should make sense independently of the rest of the document.
-    - If any of the required properties are not present on a page, leave those fields empty rather than making assumptions.
-    - For images, include detailed metadata such as:
-      - Image Title: The title or caption associated with the image.
-      - Image Description: A brief description of the image’s content and purpose.
-      - Additional Metadata: Any other relevant details, such as image source or reference numbers.
-
-    Response Format:
-    Answer in JSON format. Each page should be represented as an object with the following keys:
-
-    - "PageNumber": The number of the page.
-    - "PageTitle": The title of the page as it appears in the document.
-    - "PageContent": The exact main content and context of the page as it appears in the document.
-    - "Images": A list of objects containing:
-      - "ImageTitle": The title of the image.
-      - "ImageDescription": A description of the image.
-      - "AdditionalMetadata": Any other relevant image metadata.
-
-    Here is an example JSON format for your response:
-
-    ```json
-    [
-      {
-        "PageNumber": 1,
-        "PageTitle": "Title of the Page",
-        "PageContent": "Exact content of the page without any summarization.",
-        "Images": [
-          {
-            "ImageTitle": "Title of the Image",
-            "ImageDescription": "Description of the image.",
-            "AdditionalMetadata": "Other relevant details about the image."
-          }
-        ]
-      },
-      ...
-    ]
-    ```"""
-
-
-    response = completion_with_backoff(prompt, content)
-    if not response:
-        print("Empty response from the model")
-        return []
-
-    if hasattr(response, 'content'):
-        response_content = response.content
-        response_content = re.sub(r'```json\s*', '', response_content)
-        response_content = re.sub(r'\s*```', '', response_content)
-
-        print(f"Raw JSON response: {response_content}")
-
-        try:
-            metadata = json.loads(response_content)
-        except json.JSONDecodeError as e:
-            print(f"Error decoding JSON: {e}")
-            metadata = []
-
-    return metadata
-
-def extract_tables_and_flow_diagrams_from_pptx(pptx_path):
-    presentation = Presentation(pptx_path)
-    tables_and_diagrams = []
-
-    for slide_index, slide in enumerate(presentation.slides):
-        slide_data = {
-            "page_number": slide_index + 1,
-            "tables": [],
-            "flow_diagrams": []
-        }
-        
-        for shape in slide.shapes:
-            # Extract tables
-            if shape.has_table:
-                table_data = []
-                for row in shape.table.rows:
-                    row_data = [cell.text for cell in row.cells]
-                    table_data.append(row_data)
-                slide_data["tables"].append(table_data)
-            
-            # Extract flow diagrams (shapes)
-            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-                diagram_data = []
-                for s in shape.shapes:
-                    if s.has_text_frame:
-                        diagram_data.append(s.text)
-                slide_data["flow_diagrams"].append(diagram_data)
-        
-        if slide_data["tables"] or slide_data["flow_diagrams"]:
-            tables_and_diagrams.append(slide_data)
-    
-    return tables_and_diagrams
-
-def create_word_file_with_structured_content(json_data, pptx_path):
-    doc = Document()
-    doc.add_heading('Extracted Metadata', 0)
-
-    # Extract tables and diagrams from the PPTX file
-    structured_content = extract_tables_and_flow_diagrams_from_pptx(pptx_path)
-
-    for page in json_data:
-        doc.add_heading(f"Page {page['PageNumber']}", level=1)
-        doc.add_heading('Header', level=2)
-        doc.add_paragraph(page['PageTitle'])
-        doc.add_heading('Content', level=2)
-        doc.add_paragraph(page['PageContent'])
-
-        # Integrate structured content (tables and diagrams)
-        for structured_page in structured_content:
-            if structured_page["page_number"] == page['PageNumber']:
-                if structured_page["tables"]:
-                    doc.add_heading('Tables', level=2)
-                    for table in structured_page["tables"]:
-                        table_str = "\n".join(["\t".join(row) for row in table])
-                        doc.add_paragraph(table_str)
-
-                if structured_page["flow_diagrams"]:
-                    doc.add_heading('Flow Diagrams', level=2)
-                    for diagram in structured_page["flow_diagrams"]:
-                        doc.add_paragraph("\n".join(diagram))
-        
-        if 'Images' in page and page['Images']:
-            for image in page['Images']:
-                doc.add_heading('Image', level=2)
-                doc.add_paragraph(f"Title: {image['ImageTitle']}")
-                doc.add_paragraph(f"Description: {image['ImageDescription']}")
-                doc.add_paragraph(f"Additional Metadata: {image.get('AdditionalMetadata', 'N/A')}")
-                # Add image to the document
-                doc.add_picture(image['image_url'], width=Inches(4))
-    
-    file_stream = io.BytesIO()
-    doc.save(file_stream)
-    file_stream.seek(0)
-    return file_stream
-
-# Streamlit app
-st.title("PPT to Structured PDF and Word Document Converter")
-
-uploaded_file = st.file_uploader("Upload a PPT file", type=["pptx"])
-
-if uploaded_file is not None:
-    token = get_oauth2_token()
-    
-    if token:
-        # Upload PPT to SharePoint
-        file_id = upload_file_to_sharepoint(token, uploaded_file)
-        
-        if file_id:
-            # Convert PPT to PDF
-            pdf_content = convert_file_to_pdf(token, file_id)
-            
-            if pdf_content:
-                # Save PDF locally
-                pdf_path = Path("output.pdf")
-                with open(pdf_path, "wb") as pdf_file:
-                    pdf_file.write(pdf_content)
-                
-                # Extract text and images
-                extracted_text = extract_text_from_pdf(str(pdf_path))
-                images = extract_images_from_pdf(str(pdf_path), "extracted_images")
-                
-                # Extract metadata
-                metadata = extract_metadata(extracted_text)
-
-                if metadata:
-                    for image in images:
-                        for page in metadata:
-                            if page['PageNumber'] == image['page_number']:
-                                if 'Images' not in page or not page['Images']:
-                                    page['Images'] = []
-                                page['Images'].append({
-                                    "ImageTitle": image['title'],
-                                    "ImageDescription": image['description'],
-                                    "image_url": image['image_url']
-                                })
-
-                    st.json(metadata)
-                    
-                    # Create and download Word file with structured content
-                    word_file = create_word_file_with_structured_content(metadata, uploaded_file)
-                    st.download_button(
-                        label="Download Word file",
-                        data=word_file,
-                        file_name="extracted_metadata.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                
-                # Clean up SharePoint by deleting the uploaded file
-                delete_file_from_sharepoint(token, file_id)
-            else:
-                st.error("PDF conversion failed.")
-        else:
-            st.error("File upload to SharePoint failed.")
+import json  
+import streamlit as st  
+from pptx import Presentation  
+from pptx.enum.shapes import MSO_SHAPE_TYPE  
+from PIL import Image  
+from io import BytesIO  
+import requests  
+import base64  
+from docx import Document  
+from docx.shared import Pt  
+import fitz  # PyMuPDF  
+import os  
+import cv2  
+import numpy as np  
+  
+# Azure OpenAI credentials  
+azure_endpoint = "https://gpt-4omniwithimages.openai.azure.com/"  
+api_key = "6e98566acaf24997baa39039b6e6d183"  
+api_version = "2024-02-01"  
+model = "GPT-40-mini"  
+  
+# Azure Graph API credentials  
+GRAPH_TENANT_ID = "4d4343c6-067a-4794-91f3-5cb10073e5b4"  
+GRAPH_CLIENT_ID = "5ace14db-3235-4cd2-acfd-dd5ef19d6ea1"  
+GRAPH_CLIENT_SECRET = "HRk8Q~7G6EH3.yhDC3rB5wLAyAixQMnQNWNyUdsW"  
+PDF_SITE_ID = "marketingai.sharepoint.com,b82dbaac-09cc-4539-ad08-e4ca926796e8,7b756d20-3463-44b7-95ca-5873f8c3f517"  
+  
+# Function to get OAuth2 token  
+def get_oauth2_token():  
+    url = f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}/oauth2/v2.0/token"  
+    headers = {  
+        'Content-Type': 'application/x-www-form-urlencoded'  
+    }  
+    data = {  
+        'grant_type': 'client_credentials',  
+        'client_id': GRAPH_CLIENT_ID,  
+        'client_secret': GRAPH_CLIENT_SECRET,  
+        'scope': 'https://graph.microsoft.com/.default'  
+    }  
+    response = requests.post(url, headers=headers, data=data)  
+    if response.status_code == 200:  
+        return response.json().get('access_token')  
+    else:  
+        st.error(f"Failed to obtain OAuth2 token: {response.content}")  
+        return None  
+  
+# Function to upload file to SharePoint  
+def upload_file_to_sharepoint(token, file_path):  
+    with open(file_path, "rb") as file:  
+        upload_url = f"https://graph.microsoft.com/v1.0/sites/{PDF_SITE_ID}/drive/root:/{os.path.basename(file_path)}:/content"  
+        headers = {  
+            'Authorization': f'Bearer {token}',  
+            'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'  
+        }  
+        response = requests.put(upload_url, headers=headers, data=file.read())  
+        if response.status_code == 201:  
+            return response.json().get('id')  
+        else:  
+            st.error(f"Failed to upload file to SharePoint: {response.content}")  
+            return None  
+  
+# Function to convert file to PDF using Microsoft Graph API  
+def convert_file_to_pdf(token, file_id):  
+    convert_url = f"https://graph.microsoft.com/v1.0/sites/{PDF_SITE_ID}/drive/items/{file_id}/content?format=pdf"  
+    headers = {  
+        'Authorization': f'Bearer {token}',  
+        'Content-Type': 'application/json'  
+    }  
+    response = requests.get(convert_url, headers=headers)  
+    if response.status_code == 200:  
+        return response.content  
+    else:  
+        st.error(f"Failed to convert file to PDF: {response.content}")  
+        return None  
+  
+# Function to delete file from SharePoint  
+def delete_file_from_sharepoint(token, file_id):  
+    delete_url = f"https://graph.microsoft.com/v1.0/sites/{PDF_SITE_ID}/drive/items/{file_id}"  
+    headers = {  
+        'Authorization': f'Bearer {token}'  
+    }  
+    response = requests.delete(delete_url, headers=headers)  
+    if response.status_code == 204:  
+        return True  
+    else:  
+        st.error(f"Failed to delete file from SharePoint: {response.content}")  
+        return False  
+  
+# Function to encode image as base64  
+def encode_image(image):  
+    return base64.b64encode(image).decode("utf-8")  
+  
+def get_image_explanation(base64_image):  
+    headers = {  
+        "Content-Type": "application/json",  
+        "api-key": api_key  
+    }  
+    data = {  
+        "model": model,  
+        "messages": [  
+            {"role": "system", "content": "You are a helpful assistant that responds in Markdown."},  
+            {"role": "user", "content": [  
+                {"type": "text", "text": "Explain the content of this image in a single, coherent paragraph. The explanation should be concise and semantically meaningful, summarizing all major points from the image in one continuous paragraph. Avoid using bullet points, line breaks, or separate lists."},  
+                {"type": "image_url", "image_url": {  
+                    "url": f"data:image/png;base64,{base64_image}"}  
+                }  
+            ]}  
+        ],  
+        "temperature": 0.7  
+    }  
+  
+    response = requests.post(  
+        f"{azure_endpoint}/openai/deployments/{model}/chat/completions?api-version={api_version}",  
+        headers=headers,  
+        json=data  
+    )  
+  
+    if response.status_code == 200:  
+        result = response.json()  
+        return result["choices"][0]["message"]["content"]  
+    else:  
+        st.error(f"Error: {response.status_code} - {response.text}")  
+        return None  
+  
+def ppt_to_pdf(ppt_file, pdf_file):  
+    token = get_oauth2_token()  
+    if token:  
+        file_id = upload_file_to_sharepoint(token, ppt_file)  
+        if file_id:  
+            pdf_content = convert_file_to_pdf(token, file_id)  
+            if pdf_content:  
+                with open(pdf_file, "wb") as pdf_file:  
+                    pdf_file.write(pdf_content)  
+                delete_file_from_sharepoint(token, file_id)  
+                return True  
+    return False  
+  
+def extract_text_from_ppt(ppt_file):  
+    presentation = Presentation(ppt_file)  
+    text_content = []  
+    for slide_number, slide in enumerate(presentation.slides, start=1):  
+        slide_text = []  
+        for shape in slide.shapes:  
+            if hasattr(shape, "text"):  
+                slide_text.append(shape.text)  
+        slide_title = slide.shapes.title.text if slide.shapes.title else "Untitled Slide"  
+        text_content.append({"slide_number": slide_number, "slide_title": slide_title, "text": " ".join(slide_text)})  
+    return text_content  
+  
+def identify_visual_elements(ppt_file):  
+    presentation = Presentation(ppt_file)  
+    visual_slides = []  
+    for slide_number, slide in enumerate(presentation.slides, start=1):  
+        has_visual_elements = False  
+        for shape in slide.shapes:  
+            if shape.shape_type in {MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.TABLE, MSO_SHAPE_TYPE.CHART, MSO_SHAPE_TYPE.GROUP, MSO_SHAPE_TYPE.AUTO_SHAPE}:  
+                has_visual_elements = True  
+                break  
+        if has_visual_elements:  
+            visual_slides.append(slide_number)  
+    return visual_slides  
+  
+def capture_slide_images(pdf_file, slide_numbers):  
+    doc = fitz.open(pdf_file)  
+    images = []  
+    for slide_number in slide_numbers:  
+        page = doc[slide_number - 1]  
+        pix = page.get_pixmap()  
+        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)  
+        buffer = BytesIO()  
+        image.save(buffer, format="PNG")  
+        images.append({"slide_number": slide_number, "image": buffer.getvalue()})  
+    return images  
+  
+def generate_text_insights(text_content, visual_slides, text_length):  
+    headers = {  
+        "Content-Type": "application/json",  
+        "api-key": api_key  
+    }  
+    insights = []  
+  
+    # Set temperature based on text_length  
+    if text_length == "Standard":  
+        temperature = 0.3  
+    elif text_length == "Blend":  
+        temperature = 0.5  
+    elif text_length == "Creative":  
+        temperature = 0.7  
+  
+    for slide in text_content:  
+        slide_text = slide['text']  
+        slide_number = slide['slide_number']  
+        if len(slide_text.split()) < 20 and slide_number not in visual_slides:  
+            continue  # Skip slides with fewer than 20 words and no visual elements  
+        prompt = f"""  
+        Aspects of the present disclosure may include insights extracted from the above slide content. The information should be delivered directly and engagingly in a single, coherent paragraph. Avoid phrases like 'The slide presents,' 'discusses,' 'outlines,' or 'content.' The explanation should be concise and semantically meaningful, summarizing all major points in one paragraph without line breaks or bullet points. The text should adhere to the following style guidelines:  
+        1. Remove all listed profanity words.  
+        2. Use passive voice.  
+        3. Use conditional and tentative language, such as "may include," "in some aspects," and "aspects of the present disclosure."  
+        4. Replace "Million" with "1,000,000" and "Billion" with "1,000,000,000."  
+        5. Maintain the following tone characteristics: Precision and Specificity, Formality, Complexity, Objective and Impersonal, Structured and Systematic.  
+        6. Follow these style elements: Formal and Objective, Structured and Systematic, Technical Jargon and Terminology, Detailed and Specific, Impersonal Tone, Instructional and Descriptive, Use of Figures and Flowcharts, Legal and Protective Language, Repetitive and Redundant, Examples and Clauses.  
+        7. Use the following conditional and tentative language phrases: may include, in some aspects, aspects of the present disclosure, wireless communication networks, by way of example, may be, may further include, may be used, may occur, may use, may monitor, may periodically wake up, may demodulate, may consume, can be performed, may enter and remain, may correspond to, may also include, may be identified in response to, may be further a function of, may be multiplied by, may schedule, may select, may also double, may further comprise, may be configured to, may correspond to a duration value, may correspond to a product of, may be closer, may be significant, may not be able, may result, may reduce, may be operating in, may further be configured to, may further process, may be executed by, may be received, may avoid, may indicate, may be selected, may be proactive, may perform, may be necessary, may be amplified, may involve, may require, may be stored, may be accessed, may be transferred, may be implemented, may include instructions to, may depend upon, may communicate, may be generated, may be configured.  
+        8. Maintain the exact wording in the generated content. Do not substitute words with synonyms. For example, "instead" should remain "instead" and not be replaced with "conversely."  
+        9. Replace the phrase "further development" with "our disclosure" in all generated content.  
+        10. Make sure to use LaTeX formatting for all mathematical symbols, equations, subscripting, and superscripting to ensure they are displayed correctly in the output.  
+        11. When encountering programmatic terms or equations, ensure they are accurately represented and contextually retained.  
+        {slide_text}  
+        """  
+        if text_length == "Standard":  
+            prompt += "\n\nGenerate a short paragraph."  
+        elif text_length == "Blend":  
+            prompt += "\n\nGenerate a medium-length paragraph."  
+        elif text_length == "Creative":  
+            prompt += "\n\nGenerate a longer paragraph."  
+  
+        data = {  
+            "model": model,  
+            "messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}],  
+            "temperature": temperature  
+        }  
+  
+        response = requests.post(  
+            f"{azure_endpoint}/openai/deployments/{model}/chat/completions?api-version={api_version}",  
+            headers=headers,  
+            json=data  
+        )  
+  
+        if response.status_code == 200:  
+            result = response.json()  
+            insights.append({"slide_number": slide['slide_number'], "slide_title": slide['slide_title'], "insight": result["choices"][0]["message"]["content"]})  
+        else:  
+            st.error(f"Error: {response.status_code} - {response.text}")  
+            insights.append({"slide_number": slide['slide_number'], "slide_title": slide['slide_title'], "insight": "Error in generating insight"})  
+  
+    return insights  
+  
+def generate_image_insights(image_content, text_length):  
+    insights = []  
+  
+    # Set temperature based on text_length  
+    if text_length == "Standard":  
+        temperature = 0.3  
+    elif text_length == "Blend":  
+        temperature = 0.5  
+    elif text_length == "Creative":  
+        temperature = 0.7  
+  
+    for image_data in image_content:  
+        base64_image = encode_image(image_data['image'])  
+        headers = {  
+            "Content-Type": "application/json",  
+            "api-key": api_key  
+        }  
+        data = {  
+            "model": model,  
+            "messages": [  
+                {"role": "system", "content": "You are a helpful assistant that responds in Markdown."},  
+                {"role": "user", "content": [  
+                    {"type": "text", "text": "Explain the content of this image in a single, coherent paragraph. The explanation should be concise and semantically meaningful, summarizing all major points from the image in one continuous paragraph. Avoid using bullet points, line breaks, or separate lists."},  
+                    {"type": "image_url", "image_url": {  
+                        "url": f"data:image/png;base64,{base64_image}"}  
+                    }  
+                ]}  
+            ],  
+            "temperature": temperature  
+        }  
+  
+        response = requests.post(  
+            f"{azure_endpoint}/openai/deployments/{model}/chat/completions?api-version={api_version}",  
+            headers=headers,  
+            json=data  
+        )  
+  
+        if response.status_code == 200:  
+            result = response.json()  
+            insights.append({"slide_number": image_data['slide_number'], "slide_title": image_data.get('slide_title', 'Untitled Slide'), "insight": result["choices"][0]["message"]["content"]})  
+        else:  
+            st.error(f"Error: {response.status_code} - {response.text}")  
+            insights.append({"slide_number": image_data['slide_number'], "slide_title": image_data.get('slide_title', 'Untitled Slide'), "insight": "Error in generating insight"})  
+  
+    return insights  
+  
+def aggregate_content(text_insights, image_insights):  
+    aggregated_content = []  
+    for text in text_insights:  
+        slide_number = text['slide_number']  
+        slide_title = text['slide_title']  
+        text_insight = text['insight']  
+        image_insight = next((img['insight'] for img in image_insights if img['slide_number'] == slide_number), None)  
+        if image_insight:  
+            aggregated_content.append({  
+                "slide_number": slide_number,  
+                "slide_title": slide_title,  
+                "content": f"Referring to Figure {slide_number}. {image_insight} {text_insight}"  
+            })  
+        else:  
+            aggregated_content.append({  
+                "slide_number": slide_number,  
+                "slide_title": slide_title,  
+                "content": text_insight  
+            })  
+    return aggregated_content  
+  
+def sanitize_text(text):  
+    if text:  
+        sanitized = ''.join(c for c in text if c.isprintable() and c not in {'\x00', '\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\x07', '\x08', '\x0B', '\x0C', '\x0E', '\x0F', '\x10', '\x11', '\x12', '\x13', '\x14', '\x15', '\x16', '\x17', '\x18', '\x19', '\x1A', '\x1B', '\x1C', '\x1D', '\x1E', '\x1F'})  
+        return sanitized  
+    return text  
+  
+def save_content_to_word(aggregated_content, output_file_name, extracted_images):  
+    doc = Document()  
+    style = doc.styles['Normal']  
+    font = style.font  
+    font.name = 'Times New Roman'  
+    font.size = Pt(10.5)  # Reduced font size for paragraphs  
+    paragraph_format = style.paragraph_format  
+    paragraph_format.line_spacing = 1.5  
+    paragraph_format.alignment = 3  # Justify  
+  
+    for slide in aggregated_content:  
+        sanitized_title = sanitize_text(slide['slide_title'])  
+        sanitized_content = sanitize_text(slide['content'])  
+        doc.add_heading(f"[[{slide['slide_number']}, {sanitized_title}]]", level=1)  
+        if sanitized_content:  # Only add content if it exists  
+            doc.add_paragraph(sanitized_content)  
+  
+    # Add extracted images after the generated content  
+    if extracted_images:  
+        doc.add_heading("Extracted Images", level=1)  
+        for idx, (image, slide_number) in enumerate(extracted_images):  
+            _, buffer = cv2.imencode('.png', image)  
+            image_stream = BytesIO(buffer)  
+            doc.add_paragraph(f"Image from Slide {slide_number}:")  
+            doc.add_picture(image_stream, width=doc.sections[0].page_width - doc.sections[0].left_margin - doc.sections[0].right_margin)  
+            doc.add_paragraph("\n")  # Add space after image  
+  
+    output = BytesIO()  
+    doc.save(output)  
+    output.seek(0)  
+    return output  
+  
+def extract_and_clean_page_image(page, top_mask, bottom_mask, left_mask, right_mask):  
+    # Get the page as an image  
+    pix = page.get_pixmap()  
+    img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)  
+  
+    # Convert the image to BGR format for OpenCV  
+    img_bgr = cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR)  
+  
+    # Convert to grayscale for processing  
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  
+  
+    # Threshold the image to get binary image  
+    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)  
+  
+    # Detect contours of possible images/diagrams  
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  
+  
+    # Check if there are any valid contours (image regions)  
+    valid_contours = [cv2.boundingRect(contour) for contour in contours if cv2.boundingRect(contour)[2] > 50 and cv2.boundingRect(contour)[3] > 50]  
+    if not valid_contours:  
+        return None  # Skip the page if no valid images/diagrams are found  
+  
+    # Create a mask for the detected contours
+    mask = np.zeros_like(binary)  
+    for x, y, w, h in valid_contours:  
+        # Apply the adjustable top, bottom, left, and right masking values from the sliders  
+        # Ensure coordinates do not go out of image bounds  
+        x1 = max(0, x - left_mask)  
+        y1 = max(0, y - top_mask)  
+        x2 = min(img_bgr.shape[1], x + w + right_mask)  
+        y2 = min(img_bgr.shape[0], y + h + bottom_mask)  
+        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)  
+  
+    # Use the mask to keep only the regions with images/diagrams  
+    text_removed = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)  
+  
+    # Set the background to white where the mask is not applied  
+    background = np.ones_like(img_bgr) * 255  
+    cleaned_image = np.where(mask[:, :, None] == 255, text_removed, background)  
+  
+    # Convert cleaned image to grayscale  
+    cleaned_image_gray = cv2.cvtColor(cleaned_image, cv2.COLOR_BGR2GRAY)  
+    return cleaned_image_gray  
+  
+def extract_images_from_pdf(pdf_file, top_mask, bottom_mask, left_mask, right_mask):  
+    # Open the PDF file  
+    pdf_document = fitz.open(pdf_file)  
+    page_images = []  
+  
+    for page_num in range(len(pdf_document)):  
+        page = pdf_document.load_page(page_num)  
+  
+        # Extract and clean the page image  
+        cleaned_image = extract_and_clean_page_image(page, top_mask, bottom_mask, left_mask, right_mask)  
+        if cleaned_image is not None:  
+            page_images.append((cleaned_image, page_num + 1))  # Keep track of the slide number  
+  
+    pdf_document.close()  
+    return page_images  
+  
+def main():  
+    st.title("PPT Insights Extractor")    
+   
+    text_length = st.select_slider(  
+        "Content Generation Slider",  
+        options=["Standard", "Blend", "Creative"],  
+        value="Blend"  
+    )  
+  
+    # Add Title and Information Button for Image Extraction Slider  
+    st.sidebar.markdown("### Image Extraction Slider")  
+  
+    # Initialize session state variables for the sliders  
+    if 'top_mask' not in st.session_state:  
+        st.session_state.top_mask = 70  
+    if 'bottom_mask' not in st.session_state:  
+        st.session_state.bottom_mask = 70  
+    if 'left_mask' not in st.session_state:  
+        st.session_state.left_mask = 85  
+    if 'right_mask' not in st.session_state:  
+        st.session_state.right_mask = 85  
+  
+    # Arrange the buttons in a row using columns  
+    col1, col2 = st.sidebar.columns(2)  
+    with col1:  
+        if st.button("Default"):  
+            st.session_state.top_mask = 40  
+            st.session_state.bottom_mask = 40  
+            st.session_state.left_mask = 85  
+            st.session_state.right_mask = 85  
+            st.experimental_rerun()  # Refresh the page to apply the changes  
+  
+    with col2:  
+        if st.button("A4"):  
+            st.session_state.top_mask = 70  
+            st.session_state.bottom_mask = 70  
+            st.session_state.left_mask = 85  
+            st.session_state.right_mask = 85  
+            st.experimental_rerun()  # Refresh the page to apply the changes  
+  
+    # Add sliders to adjust the top, bottom, left, and right masking values  
+    top_mask = st.sidebar.slider("Adjust Top Masking Value", min_value=10, max_value=100, value=st.session_state.top_mask, step=1)  
+    bottom_mask = st.sidebar.slider("Adjust Bottom Masking Value", min_value=10, max_value=100, value=st.session_state.bottom_mask, step=1)  
+    left_mask = st.sidebar.slider("Adjust Left Masking Value", min_value=10, max_value=500, value=st.session_state.left_mask, step=1)  
+    right_mask = st.sidebar.slider("Adjust Right Masking Value", min_value=10, max_value=200, value=st.session_state.right_mask, step=1)  
+  
+    # Update session state if sliders are moved  
+    if top_mask != st.session_state.top_mask or bottom_mask != st.session_state.bottom_mask or left_mask != st.session_state.left_mask or right_mask != st.session_state.right_mask:  
+        st.session_state.top_mask = top_mask  
+        st.session_state.bottom_mask = bottom_mask  
+        st.session_state.left_mask = left_mask  
+        st.session_state.right_mask = right_mask  
+        st.experimental_rerun()  # Refresh the page to apply the changes  
+  
+    uploaded_ppt = st.file_uploader("Upload a PPT file", type=["pptx"])  
+  
+    if uploaded_ppt is not None:  
+        st.info("Processing PPT file...")  
+  
+        # Extract the base name of the uploaded PPT file  
+        ppt_filename = uploaded_ppt.name  
+        base_filename = os.path.splitext(ppt_filename)[0]  
+        output_word_filename = f"{base_filename}.docx"  
+  
+        # Convert PPT to PDF  
+        with open("temp_ppt.pptx", "wb") as f:  
+            f.write(uploaded_ppt.read())  
+        if not ppt_to_pdf("temp_ppt.pptx", "temp_pdf.pdf"):  
+            st.error("PDF conversion failed. Please check the uploaded PPT file.")  
+            return  
+  
+        # Extract text and identify slides with visual elements  
+        text_content = extract_text_from_ppt("temp_ppt.pptx")  
+        visual_slides = identify_visual_elements("temp_ppt.pptx")  
+  
+        # Capture images of marked slides  
+        slide_images = capture_slide_images("temp_pdf.pdf", visual_slides)  
+  
+        st.info("Generating text insights...")  
+        text_insights = generate_text_insights(text_content, visual_slides, text_length)  
+  
+        st.info("Generating image insights...")  
+        image_insights = generate_image_insights(slide_images, text_length)  
+  
+        st.info("Extracting additional images...")  
+        extracted_images = extract_images_from_pdf("temp_pdf.pdf", top_mask, bottom_mask, left_mask, right_mask)  
+  
+        st.info("Aggregating content...")  
+        aggregated_content = aggregate_content(text_insights, image_insights)  
+  
+        st.info("Saving to Word document...")  
+        output_doc = save_content_to_word(aggregated_content, output_word_filename, extracted_images)  
+  
+        st.download_button(label="Download Word Document", data=output_doc, file_name=output_word_filename)  
+  
+        st.success("Processing completed successfully!")  
+  
+if __name__ == "__main__":  
+    main()  
